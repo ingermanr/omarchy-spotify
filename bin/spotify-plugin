@@ -141,50 +141,51 @@ sp_api_search() {
   local query="$1"
   local token
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
-  local encoded
+  local encoded payload
   encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
-  curl -fsS -m 10 -H "Authorization: Bearer $token" \
-    "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" 2>/dev/null |
-    python3 -c "
+  payload=$(curl -fsS -m 10 -H "Authorization: Bearer $token" \
+    "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" 2>/dev/null) || true
+  python3 -c '
 import json, sys
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(sys.argv[1])
     tracks = []
-    for t in data.get('tracks', {}).get('items', []):
+    for t in data.get("tracks", {}).get("items", []):
         tracks.append({
-            'name': t.get('name', ''),
-            'artist': ', '.join(a.get('name','') for a in t.get('artists', [])),
-            'album': t.get('album', {}).get('name', ''),
-            'uri': t.get('uri', ''),
-            'id': t.get('id', '')
+            "name": t.get("name", ""),
+            "artist": ", ".join(a.get("name","") for a in t.get("artists", [])),
+            "album": t.get("album", {}).get("name", ""),
+            "uri": t.get("uri", ""),
+            "id": t.get("id", "")
         })
-    print(json.dumps({'tracks': tracks}))
+    print(json.dumps({"tracks": tracks}))
 except Exception:
-    print(json.dumps({'tracks': [], 'error': 'parse error'}))
-"
+    print(json.dumps({"tracks": [], "error": "parse error"}))
+' "$payload"
 }
 
 sp_api_playlists() {
   local token
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
-  curl -fsS -m 10 -H "Authorization: Bearer $token" \
-    "https://api.spotify.com/v1/browse/featured-playlists?limit=12" 2>/dev/null |
-    python3 -c "
+  local payload
+  payload=$(curl -fsS -m 10 -H "Authorization: Bearer $token" \
+    "https://api.spotify.com/v1/browse/featured-playlists?limit=12" 2>/dev/null) || true
+  python3 -c '
 import json, sys
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(sys.argv[1])
     playlists = []
-    for p in data.get('playlists', {}).get('items', []):
+    for p in data.get("playlists", {}).get("items", []):
         playlists.append({
-            'name': p.get('name', ''),
-            'owner': p.get('owner', {}).get('display_name', 'Spotify'),
-            'uri': p.get('uri', ''),
-            'id': p.get('id', '')
+            "name": p.get("name", ""),
+            "owner": p.get("owner", {}).get("display_name", "Spotify"),
+            "uri": p.get("uri", ""),
+            "id": p.get("id", "")
         })
-    print(json.dumps({'playlists': playlists}))
+    print(json.dumps({"playlists": playlists}))
 except Exception:
-    print(json.dumps({'playlists': [], 'error': 'parse error'}))
-"
+    print(json.dumps({"playlists": [], "error": "parse error"}))
+' "$payload"
 }
 
 # Resolve the configured favourite artists (SPOTIFY_ARTISTS) to real Spotify
@@ -255,7 +256,7 @@ PY
 )
 
   # Cache only successful lookups, so a transient failure is not remembered.
-  python3 - "$ARTIST_CACHE" "$key" "$result" 2>/dev/null <<'PY' || true
+  python3 -c '
 import json, sys, time
 try:
     data = json.loads(sys.argv[3])
@@ -263,7 +264,7 @@ try:
         json.dump({"ts": time.time(), "key": sys.argv[2], "data": data}, open(sys.argv[1], "w"))
 except Exception:
     pass
-PY
+' "$ARTIST_CACHE" "$key" "$result" 2>/dev/null || true
   echo "$result"
 }
 
