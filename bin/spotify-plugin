@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# spotify-plugin — helper for the Omarchy Spotify bar widget.
+#
+# Controls Spotify via Mpris/D-Bus (play/pause, next/previous, current track)
+# and Spotify Web API (search, playlists). Requires the official Spotify client
+# (`spotify`) running for playback control; search/playlists work with or
+# without Spotify running, but need API credentials.
+#
+# Commands:
+#   status          JSON with running/playing/title/artist/album
+#   play-pause | next | previous | play | pause   D-Bus action
+#   launch          Start Spotify if not running
+#   search <query>  Search tracks via Spotify Web API (needs credentials)
+#   playlists       List featured playlists via Spotify Web API (needs credentials)
+#   artists         List main artists: the configured favourites resolved via
+#                   search, or your top artists when no favourites are set
+#   top-tracks <id> The artist's most popular tracks (cached per artist)
+#   play-uri <uri>  Play a context/track via Web API, else open it in the client
+#   play-tracks <uri>...        Queue several tracks (Web API + user token)
+#   play-artist-top <id>        Play an artist's most popular tracks
+#
+# Credentials (set via env or omarchy plugin settings):
+#   SPOTIFY_ACCESS_TOKEN   — bearer token used directly (simplest)
+#   SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET   — client credentials flow
+#   SPOTIFY_ARTISTS        — comma-separated favourite artist names (optional)
+#   SPOTIFY_MARKET         — ISO market for top-tracks, e.g. ES (optional)
+set -euo pipefail
+umask 077
+
+DBUS_DEST="org.mpris.MediaPlayer2.spotify"
+DBUS_PATH="/org/mpris/MediaPlayer2"
+DBUS_IFACE="org.mpris.MediaPlayer2.Player"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SPOTIFY_CLIENT_ID="${SPOTIFY_CLIENT_ID:-}"
+SPOTIFY_CLIENT_SECRET="${SPOTIFY_CLIENT_SECRET:-}"
+SPOTIFY_ACCESS_TOKEN="${SPOTIFY_ACCESS_TOKEN:-}"
+SPOTIFY_ARTISTS="${SPOTIFY_ARTISTS:-}"
+SPOTIFY_MARKET="${SPOTIFY_MARKET:-}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+TOKEN_FILE="$RUNTIME_DIR/spotify-plugin-token.json"
+ARTIST_CACHE="$RUNTIME_DIR/spotify-plugin-artists.json"
+TOPTRACK_CACHE="$RUNTIME_DIR/spotify-plugin-toptracks.json"
+ARTIST_CACHE_TTL=600
+
+# ---------------------------------------------------------------------------
+# D-Bus / Mpris
+# ---------------------------------------------------------------------------
+is_running() {
+  gdbus call --session --dest=org.freedesktop.DBus \
+    --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner "$DBUS_DEST" 2>/dev/null |
+    grep -q "true"
+}
+
+dbus_call_action() {
+  local action="$1"
+  gdbus call --session --dest="$DBUS_DEST" --object-path "$DBUS_PATH" \
+    --method "$DBUS_IFACE.$action" >/dev/null 2>&1 || true
+}
+
+# Returns JSON: {running, playing, title, artist, album}
+dbus_get_metadata() {
+  python3 - <<'PY'
+import subprocess, json, re, sys
+
+DEST = "org.mpris.MediaPlayer2.spotify"
+PATH = "/org/mpris/MediaPlayer2"
+
+def gdbus_get(prop):
+    try:
+        return subprocess.check_output(
+            ["gdbus", "call", "--session", "--dest", DEST, "--object-path", PATH,
+             "--method", "org.freedesktop.DBus.Properties.Get",
+             "org.mpris.MediaPlayer2.Player", prop],
+            stderr=subprocess.DEVNULL
+        ).decode()
+    except Exception:
+        return ""
+
+def extract_str(out, key):
+    m = re.search(r"'%s': <'([^']*)'>" % key, out)
+    return m.group(1) if m else ""
+
+def extract_str_list(out, key):
+    m = re.search(r"'%s': <\[(.*)\]>" % key, out)
+    if not m:
+        return []
+    return re.findall(r"<'( [^']* )'>", m.group(1)) or re.findall(r"'([^']*)'", m.group(1))
+
+metadata = gdbus_get("Metadata")
+status = gdbus_get("PlaybackStatus")
+
+running = bool(metadata.strip())
+if not running:
+    print(json.dumps({"running": False}))
+    sys.exit(0)
+
+title = extract_str(metadata, "xesam:title")
+artists = extract_str_list(metadata, "xesam:artist")
+artist = ", ".join(artists) if artists else ""
+album = extract_str(metadata, "xesam:album")
+playing = "Playing" in status
+
+print(json.dumps({
+    "running": True,
+    "playing": playing,
+    "title": title,
+    "artist": artist,
+    "album": album
+}))
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Spotify Web API
+# ---------------------------------------------------------------------------
+get_access_token() {
+  if [[ -n "${SPOTIFY_ACCESS_TOKEN:-}" ]]; then
+    echo "$SPOTIFY_ACCESS_TOKEN"; return 0
+  fi
+  if [[ -f "$TOKEN_FILE" ]]; then
+    local token
+    token=$(jq -r '.access_token // empty' "$TOKEN_FILE" 2>/dev/null || true)
+    if [[ -n "$token" ]]; then echo "$token"; return 0; fi
+  fi
+  if [[ -n "$SPOTIFY_CLIENT_ID" && -n "$SPOTIFY_CLIENT_SECRET" ]]; then
+    local resp token
+    resp=$(curl -fsS -m 10 -u "${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}" \
+      -d grant_type=client_credentials \
+      https://accounts.spotify.com/api/token 2>/dev/null) || true
+    token=$(echo "$resp" | jq -r '.access_token // empty' 2>/dev/null || true)
+    if [[ -n "$token" ]]; then echo "$token"; return 0; fi
+  fi
+  return 1
+}
+
+sp_api_search() {
+  local query="$1"
+  local token
+  token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
+  local encoded
+  encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
+  curl -fsS -m 10 -H "Authorization: Bearer $token" \
+    "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" 2>/dev/null |
+    python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    tracks = []
+    for t in data.get('tracks', {}).get('items', []):
+        tracks.append({
+            'name': t.get('name', ''),
+            'artist': ', '.join(a.get('name','') for a in t.get('artists', [])),
+            'album': t.get('album', {}).get('name', ''),
+            'uri': t.get('uri', ''),
+            'id': t.get('id', '')
+        })
+    print(json.dumps({'tracks': tracks}))
+except Exception:
+    print(json.dumps({'tracks': [], 'error': 'parse error'}))
+"
+}
+
+sp_api_playlists() {
+  local token
+  token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
+  curl -fsS -m 10 -H "Authorization: Bearer $token" \
+    "https://api.spotify.com/v1/browse/featured-playlists?limit=12" 2>/dev/null |
+    python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    playlists = []
+    for p in data.get('playlists', {}).get('items', []):
+        playlists.append({
+            'name': p.get('name', ''),
+            'owner': p.get('owner', {}).get('display_name', 'Spotify'),
+            'uri': p.get('uri', ''),
+            'id': p.get('id', '')
+        })
+    print(json.dumps({'playlists': playlists}))
+except Exception:
+    print(json.dumps({'playlists': [], 'error': 'parse error'}))
+"
+}
+
+# Resolve the configured favourite artists (SPOTIFY_ARTISTS) to real Spotify
+# artists via search, or fall back to your personal top artists when the list is
+# empty and a user-scoped token is available. Cached for ARTIST_CACHE_TTL.
+sp_api_artists() {
+  local key="${SPOTIFY_ARTISTS:-__top__}" cached
+
+  cached=$(python3 - "$ARTIST_CACHE" "$key" "$ARTIST_CACHE_TTL" 2>/dev/null <<'PY'
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    if d.get("key") == sys.argv[2] and time.time() - d.get("ts", 0) < int(sys.argv[3]):
+        print(json.dumps(d["data"]))
+except Exception:
+    pass
+PY
+)
+  if [[ -n "$cached" ]]; then echo "$cached"; return 0; fi
+
+  local token
+  token=$(get_access_token) || { echo '{"artists": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
+
+  local result
+  result=$(python3 - "$token" "$SPOTIFY_ARTISTS" <<'PY'
+import json, sys, urllib.request, urllib.parse
+
+token = sys.argv[1]
+favourites = [a.strip() for a in sys.argv[2].split(",") if a.strip()]
+
+def api(path):
+    req = urllib.request.Request(
+        "https://api.spotify.com/v1/" + path,
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+def artist_obj(a):
+    imgs = a.get("images") or []
+    return {
+        "name": a.get("name", ""),
+        "uri": a.get("uri", ""),
+        "id": a.get("id", ""),
+        "image": imgs[0]["url"] if imgs else "",
+        "genre": (a.get("genres") or [""])[0],
+    }
+
+artists, error = [], ""
+try:
+    if favourites:
+        for name in favourites:
+            data = api("search?q=%s&type=artist&limit=1" % urllib.parse.quote(name))
+            items = data.get("artists", {}).get("items", [])
+            if items:
+                artists.append(artist_obj(items[0]))
+    else:
+        data = api("me/top/artists?limit=12&time_range=long_term")
+        for a in data.get("items", []):
+            artists.append(artist_obj(a))
+except Exception as e:
+    error = str(e)
+
+out = {"artists": artists}
+if error:
+    out["error"] = error
+print(json.dumps(out))
+PY
+)
+
+  # Cache only successful lookups, so a transient failure is not remembered.
+  python3 - "$ARTIST_CACHE" "$key" "$result" 2>/dev/null <<'PY' || true
+import json, sys, time
+try:
+    data = json.loads(sys.argv[3])
+    if "error" not in data:
+        json.dump({"ts": time.time(), "key": sys.argv[2], "data": data}, open(sys.argv[1], "w"))
+except Exception:
+    pass
+PY
+  echo "$result"
+}
+
+# The artist's most popular tracks. Cached per artist (multi-entry) for
+# ARTIST_CACHE_TTL. Tries `from_token` first (user tokens) then a country market.
+sp_api_top_tracks() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || { echo '{"tracks": [], "error": "missing artist id"}'; return 0; }
+
+  local key="top:$id" cached
+  cached=$(python3 - "$TOPTRACK_CACHE" "$key" "$ARTIST_CACHE_TTL" 2>/dev/null <<'PY'
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    e = d.get(sys.argv[2])
+    if e and time.time() - e.get("ts", 0) < int(sys.argv[3]):
+        print(json.dumps(e["data"]))
+except Exception:
+    pass
+PY
+)
+  if [[ -n "$cached" ]]; then echo "$cached"; return 0; fi
+
+  local token
+  token=$(get_access_token) || { echo '{"tracks": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
+
+  local result
+  result=$(python3 - "$token" "$id" "$SPOTIFY_MARKET" <<'PY'
+import json, sys, urllib.request
+
+token, artist_id, market = sys.argv[1], sys.argv[2], sys.argv[3]
+markets = [market] if market else ["from_token", "US"]
+
+def fetch(m):
+    req = urllib.request.Request(
+        "https://api.spotify.com/v1/artists/%s/top-tracks?market=%s" % (artist_id, m),
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+def track_obj(t):
+    return {
+        "name": t.get("name", ""),
+        "uri": t.get("uri", ""),
+        "artist": (t.get("artists") or [{}])[0].get("name", ""),
+        "album": (t.get("album") or {}).get("name", ""),
+        "duration": t.get("duration_ms", 0),
+    }
+
+tracks, error = [], ""
+for m in markets:
+    try:
+        data = fetch(m)
+        tracks = [track_obj(t) for t in data.get("tracks", [])][:10]
+        error = ""
+        break
+    except Exception as e:
+        error = str(e)
+
+out = {"tracks": tracks}
+if error:
+    out["error"] = error
+print(json.dumps(out))
+PY
+)
+
+  # Multi-entry cache: keep several artists, only store successful lookups.
+  python3 - "$TOPTRACK_CACHE" "$key" "$result" 2>/dev/null <<'PY' || true
+import json, sys, time
+try:
+    data = json.loads(sys.argv[3])
+    if "error" not in data:
+        try:
+            d = json.load(open(sys.argv[1]))
+        except Exception:
+            d = {}
+        d[sys.argv[2]] = {"ts": time.time(), "data": data}
+        json.dump(d, open(sys.argv[1], "w"))
+except Exception:
+    pass
+PY
+  echo "$result"
+}
+
+# Play a Spotify context (artist/album/playlist) or a single track through the
+# Web API when a user-scoped token is available; otherwise open it in the client.
+play_uri() {
+  local uri="${1:-}"
+  [[ -n "$uri" ]] || return 1
+
+  local token
+  if token=$(get_access_token) 2>/dev/null && [[ -n "$token" ]]; then
+    local body code
+    if [[ "$uri" == spotify:track:* ]]; then
+      body="{\"uris\": [\"$uri\"]}"
+    else
+      body="{\"context_uri\": \"$uri\"}"
+    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
+      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      -d "$body" "https://api.spotify.com/v1/me/player/play" 2>/dev/null) || code=000
+    [[ "$code" == "204" || "$code" == "200" ]] && return 0
+  fi
+
+  # Fallback: open it in the client (the user presses play).
+  if is_running; then
+    gdbus call --session --dest="$DBUS_DEST" --object-path "$DBUS_PATH" \
+      --method org.mpris.MediaPlayer2.Player.OpenUri "$uri" >/dev/null 2>&1 || true
+  else
+    nohup spotify "$uri" >/dev/null 2>&1 &
+  fi
+}
+
+# Play a list of track URIs as the current queue (Web API + user token).
+# Falls back to opening the first track in the client.
+play_tracks() {
+  local uris=("$@")
+  [[ ${#uris[@]} -gt 0 ]] || return 1
+
+  local token
+  if token=$(get_access_token) 2>/dev/null && [[ -n "$token" ]]; then
+    local body code
+    body=$(printf '%s\n' "${uris[@]}" | jq -R . | jq -s '{uris: .}')
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
+      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      -d "$body" "https://api.spotify.com/v1/me/player/play" 2>/dev/null) || code=000
+    [[ "$code" == "204" || "$code" == "200" ]] && return 0
+  fi
+
+  # Fallback: open the first track in the client.
+  play_uri "${uris[0]}"
+}
+
+# Play an artist's most popular tracks. Falls back to the artist context when
+# the top tracks cannot be resolved (e.g. no credentials).
+play_artist_top() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || return 1
+
+  local json uris=() u
+  json=$(sp_api_top_tracks "$id")
+  while IFS= read -r u; do
+    [[ -n "$u" ]] && uris+=("$u")
+  done < <(echo "$json" | jq -r '.tracks[]?.uri' 2>/dev/null)
+
+  if [[ ${#uris[@]} -gt 0 ]]; then
+    play_tracks "${uris[@]}"
+  else
+    play_uri "spotify:artist:$id"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+cmd=${1:-status}
+shift || true
+
+case "$cmd" in
+  status)
+    dbus_get_metadata
+    ;;
+  play-pause)
+    dbus_call_action PlayPause
+    ;;
+  next)
+    dbus_call_action Next
+    ;;
+  previous)
+    dbus_call_action Previous
+    ;;
+  play)
+    dbus_call_action Play
+    ;;
+  pause)
+    dbus_call_action Pause
+    ;;
+  launch)
+    if ! is_running; then
+      nohup spotify >/dev/null 2>&1 &
+    fi
+    ;;
+  search)
+    sp_api_search "${1:-}"
+    ;;
+  playlists)
+    sp_api_playlists
+    ;;
+  artists)
+    sp_api_artists
+    ;;
+  play-uri)
+    play_uri "${1:-}"
+    ;;
+  play-tracks)
+    play_tracks "$@"
+    ;;
+  top-tracks)
+    sp_api_top_tracks "${1:-}"
+    ;;
+  play-artist-top)
+    play_artist_top "${1:-}"
+    ;;
+  open-uri)
+    # Open a Spotify URI in the client (e.g. spotify:track:xxxx)
+    local uri="${1:-}"
+    if [[ -n "$uri" ]]; then
+      if is_running; then
+        gdbus call --session --dest="$DBUS_DEST" --object-path "$DBUS_PATH" \
+          --method org.mpris.MediaPlayer2.Player.OpenUri "$uri" >/dev/null 2>&1 || true
+      else
+        nohup spotify "$uri" >/dev/null 2>&1 &
+      fi
+    fi
+    ;;
+  *)
+    echo '{"error": "unknown command"}' >&2
+    exit 1
+    ;;
+esac

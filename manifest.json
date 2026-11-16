@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ingermanr.spotify",
+  "name": "Spotify",
+  "version": "1.0.0",
+  "author": "ingermanr",
+  "license": "MIT",
+  "description": "Control Spotify from the Omarchy bar: play/pause, next/previous, current track, track search, main artists, and playlists.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Spotify",
+    "description": "Spotify playback control and quick search from the bar.",
+    "category": "Widgets",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status refresh interval (seconds)",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "favoriteArtists",
+        "type": "string",
+        "label": "Main artists",
+        "defaultValue": "",
+        "description": "Comma-separated artist names shown in the Main artists section, e.g. Radiohead, Portishead, Massive Attack. Leave empty to use your personal Spotify top artists (needs a user access token)."
+      },
+      {
+        "key": "spotifyClientId",
+        "type": "string",
+        "label": "Spotify Client ID",
+        "defaultValue": "",
+        "description": "Required for search and playlists. Get it from https://developer.spotify.com/dashboard"
+      },
+      {
+        "key": "spotifyClientSecret",
+        "type": "string",
+        "label": "Spotify Client Secret",
+        "defaultValue": "",
+        "description": "Required for search and playlists. Stored in plain text in your Omarchy shell config."
+      },
+      {
+        "key": "spotifyAccessToken",
+        "type": "string",
+        "label": "Spotify Access Token",
+        "defaultValue": "",
+        "description": "Optional bearer token used directly for Spotify API calls instead of client credentials flow."
+      }
+    ]
+  }
+}
