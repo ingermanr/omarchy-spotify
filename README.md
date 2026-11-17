@@ -51,6 +51,11 @@ Search, main artists and playlists need a Client ID and Client Secret from
 > also keep somewhere sensitive. Playback control keeps working with the
 > credential fields empty.
 
+The helper receives these values through its environment and never puts them
+on a command line: `curl` reads them from a config on stdin and the bundled
+Python reads them from its environment, so other local users cannot see them in
+`/proc/<pid>/cmdline`.
+
 A bearer token can be configured instead of the client credentials. A token
 created with the `user-modify-playback-state` scope is also what allows the
 panel to start playback; without it, *Play* opens the item in the Spotify
@@ -96,6 +101,15 @@ play-tracks <uri>...      queue several tracks
 play-artist-top <id>      play an artist's popular tracks
 open-uri <uri>            open a URI in the client
 ```
+
+## Tests
+
+```bash
+tests/secrets-not-in-argv.sh
+```
+
+Runs every Web API command with `curl` and `python3` shims and fails if a
+credential appears in any process arguments. It makes no network requests.
 
 ## License
 

@@ -127,8 +127,9 @@ get_access_token() {
     if [[ -n "$token" ]]; then echo "$token"; return 0; fi
   fi
   if [[ -n "$SPOTIFY_CLIENT_ID" && -n "$SPOTIFY_CLIENT_SECRET" ]]; then
-    local resp token
-    resp=$(curl -fsS -m 10 -u "${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}" \
+    local resp token user
+    user=$(curl_config_quote "${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}") || return 1
+    resp=$(printf 'user = %s\n' "$user" | curl --config - -fsS -m 10 \
       -d grant_type=client_credentials \
       https://accounts.spotify.com/api/token 2>/dev/null) || true
     token=$(echo "$resp" | jq -r '.access_token // empty' 2>/dev/null || true)
@@ -137,13 +138,35 @@ get_access_token() {
   return 1
 }
 
+# Credentials never go on a command line: /proc/<pid>/cmdline is readable by
+# other local users. curl receives them as a config file on stdin and python
+# through its environment, which only the same user can read.
+
+# Quote a value for a curl config line. Rejects line breaks, which would let
+# the value start a new config directive.
+curl_config_quote() {
+  local v="$1"
+  [[ "$v" != *$'\n'* && "$v" != *$'\r'* ]] || return 1
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '"%s"' "$v"
+}
+
+# curl with a bearer token header read from stdin. Usage: curl_bearer <token> <curl args...>
+curl_bearer() {
+  local token="$1" header
+  shift
+  header=$(curl_config_quote "Authorization: Bearer $token") || return 1
+  printf 'header = %s\n' "$header" | curl --config - "$@"
+}
+
 sp_api_search() {
   local query="$1"
   local token
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
   local encoded payload
   encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
-  payload=$(curl -fsS -m 10 -H "Authorization: Bearer $token" \
+  payload=$(curl_bearer "$token" -fsS -m 10 \
     "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" 2>/dev/null) || true
   python3 -c '
 import json, sys
@@ -168,7 +191,7 @@ sp_api_playlists() {
   local token
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
   local payload
-  payload=$(curl -fsS -m 10 -H "Authorization: Bearer $token" \
+  payload=$(curl_bearer "$token" -fsS -m 10 \
     "https://api.spotify.com/v1/browse/featured-playlists?limit=12" 2>/dev/null) || true
   python3 -c '
 import json, sys
@@ -210,11 +233,11 @@ PY
   token=$(get_access_token) || { echo '{"artists": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
 
   local result
-  result=$(python3 - "$token" "$SPOTIFY_ARTISTS" <<'PY'
-import json, sys, urllib.request, urllib.parse
+  result=$(SPOTIFY_BEARER="$token" python3 - "$SPOTIFY_ARTISTS" <<'PY'
+import json, os, sys, urllib.request, urllib.parse
 
-token = sys.argv[1]
-favourites = [a.strip() for a in sys.argv[2].split(",") if a.strip()]
+token = os.environ["SPOTIFY_BEARER"]
+favourites = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
 
 def api(path):
     req = urllib.request.Request(
@@ -292,10 +315,11 @@ PY
   token=$(get_access_token) || { echo '{"tracks": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
 
   local result
-  result=$(python3 - "$token" "$id" "$SPOTIFY_MARKET" <<'PY'
-import json, sys, urllib.request
+  result=$(SPOTIFY_BEARER="$token" python3 - "$id" "$SPOTIFY_MARKET" <<'PY'
+import json, os, sys, urllib.request
 
-token, artist_id, market = sys.argv[1], sys.argv[2], sys.argv[3]
+token = os.environ["SPOTIFY_BEARER"]
+artist_id, market = sys.argv[1], sys.argv[2]
 markets = [market] if market else ["from_token", "US"]
 
 def fetch(m):
@@ -363,8 +387,8 @@ play_uri() {
     else
       body="{\"context_uri\": \"$uri\"}"
     fi
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
-      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+    code=$(curl_bearer "$token" -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
+      -H "Content-Type: application/json" \
       -d "$body" "https://api.spotify.com/v1/me/player/play" 2>/dev/null) || code=000
     [[ "$code" == "204" || "$code" == "200" ]] && return 0
   fi
@@ -388,8 +412,8 @@ play_tracks() {
   if token=$(get_access_token) 2>/dev/null && [[ -n "$token" ]]; then
     local body code
     body=$(printf '%s\n' "${uris[@]}" | jq -R . | jq -s '{uris: .}')
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
-      -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+    code=$(curl_bearer "$token" -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
+      -H "Content-Type: application/json" \
       -d "$body" "https://api.spotify.com/v1/me/player/play" 2>/dev/null) || code=000
     [[ "$code" == "204" || "$code" == "200" ]] && return 0
   fi
