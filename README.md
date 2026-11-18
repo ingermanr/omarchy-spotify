@@ -109,7 +109,8 @@ tests/secrets-not-in-argv.sh
 ```
 
 Runs every Web API command with `curl` and `python3` shims and fails if a
-credential appears in any process arguments. It makes no network requests.
+credential or an API response body reaches a process argument, so nothing
+private is visible in `/proc/<pid>/cmdline`. It makes no network requests.
 
 ## License
 

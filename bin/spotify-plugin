@@ -138,9 +138,10 @@ get_access_token() {
   return 1
 }
 
-# Credentials never go on a command line: /proc/<pid>/cmdline is readable by
-# other local users. curl receives them as a config file on stdin and python
-# through its environment, which only the same user can read.
+# Nothing private goes on a command line: /proc/<pid>/cmdline is readable by
+# other local users. curl receives credentials as a config file on stdin,
+# python receives the bearer token through its environment, which only the same
+# user can read, and API response bodies travel over a pipe, never in argv.
 
 # Quote a value for a curl config line. Rejects line breaks, which would let
 # the value start a new config directive.
@@ -165,13 +166,13 @@ sp_api_search() {
   local token
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
   local encoded payload
-  encoded=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
+  encoded=$(printf '%s' "$query" | jq -sRr @uri)
   payload=$(curl_bearer "$token" -fsS -m 10 \
     "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" 2>/dev/null) || true
-  python3 -c '
+  printf '%s' "$payload" | python3 -c '
 import json, sys
 try:
-    data = json.loads(sys.argv[1])
+    data = json.loads(sys.stdin.read())
     tracks = []
     for t in data.get("tracks", {}).get("items", []):
         tracks.append({
@@ -184,7 +185,7 @@ try:
     print(json.dumps({"tracks": tracks}))
 except Exception:
     print(json.dumps({"tracks": [], "error": "parse error"}))
-' "$payload"
+'
 }
 
 sp_api_playlists() {
@@ -193,10 +194,10 @@ sp_api_playlists() {
   local payload
   payload=$(curl_bearer "$token" -fsS -m 10 \
     "https://api.spotify.com/v1/browse/featured-playlists?limit=12" 2>/dev/null) || true
-  python3 -c '
+  printf '%s' "$payload" | python3 -c '
 import json, sys
 try:
-    data = json.loads(sys.argv[1])
+    data = json.loads(sys.stdin.read())
     playlists = []
     for p in data.get("playlists", {}).get("items", []):
         playlists.append({
@@ -208,7 +209,7 @@ try:
     print(json.dumps({"playlists": playlists}))
 except Exception:
     print(json.dumps({"playlists": [], "error": "parse error"}))
-' "$payload"
+'
 }
 
 # Resolve the configured favourite artists (SPOTIFY_ARTISTS) to real Spotify
@@ -233,11 +234,11 @@ PY
   token=$(get_access_token) || { echo '{"artists": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
 
   local result
-  result=$(SPOTIFY_BEARER="$token" python3 - "$SPOTIFY_ARTISTS" <<'PY'
-import json, os, sys, urllib.request, urllib.parse
+  result=$(SPOTIFY_BEARER="$token" SPOTIFY_FAVOURITES="$SPOTIFY_ARTISTS" python3 - <<'PY'
+import json, os, urllib.request, urllib.parse
 
 token = os.environ["SPOTIFY_BEARER"]
-favourites = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
+favourites = [a.strip() for a in os.environ.get("SPOTIFY_FAVOURITES", "").split(",") if a.strip()]
 
 def api(path):
     req = urllib.request.Request(
@@ -279,15 +280,16 @@ PY
 )
 
   # Cache only successful lookups, so a transient failure is not remembered.
-  python3 -c '
+  # The response arrives on stdin, so it never shows up in a process argv.
+  printf '%s' "$result" | python3 -c '
 import json, sys, time
 try:
-    data = json.loads(sys.argv[3])
+    data = json.loads(sys.stdin.read())
     if "error" not in data:
         json.dump({"ts": time.time(), "key": sys.argv[2], "data": data}, open(sys.argv[1], "w"))
 except Exception:
     pass
-' "$ARTIST_CACHE" "$key" "$result" 2>/dev/null || true
+' "$ARTIST_CACHE" "$key" 2>/dev/null || true
   echo "$result"
 }
 
@@ -356,10 +358,11 @@ PY
 )
 
   # Multi-entry cache: keep several artists, only store successful lookups.
-  python3 - "$TOPTRACK_CACHE" "$key" "$result" 2>/dev/null <<'PY' || true
+  # The response arrives on stdin, so it never shows up in a process argv.
+  printf '%s' "$result" | python3 -c '
 import json, sys, time
 try:
-    data = json.loads(sys.argv[3])
+    data = json.loads(sys.stdin.read())
     if "error" not in data:
         try:
             d = json.load(open(sys.argv[1]))
@@ -369,7 +372,7 @@ try:
         json.dump(d, open(sys.argv[1], "w"))
 except Exception:
     pass
-PY
+' "$TOPTRACK_CACHE" "$key" 2>/dev/null || true
   echo "$result"
 }
 
