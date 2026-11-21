@@ -93,6 +93,7 @@ status                    JSON: running/playing/title/artist/album
 play-pause | next | previous | play | pause
 launch                    start Spotify if it is not running
 search <query>            search tracks
+search -                  search tracks, reading the query from stdin
 playlists                 featured playlists
 artists                   main artists (favourites or top artists)
 top-tracks <artist_id>    an artist's most popular tracks
@@ -105,12 +106,20 @@ open-uri <uri>            open a URI in the client
 ## Tests
 
 ```bash
-tests/secrets-not-in-argv.sh
+for t in tests/*-*.sh; do "$t"; done
 ```
 
-Runs every Web API command with `curl` and `python3` shims and fails if a
-credential or an API response body reaches a process argument, so nothing
-private is visible in `/proc/<pid>/cmdline`. It makes no network requests.
+The tests run the helper with `curl` and `python3` shims and a fake HTTPS
+handler, so they make no network requests.
+
+- `tests/secrets-not-in-argv.sh` fails if a credential, an API response body
+  or a search query reaches a process argument, so nothing private is visible
+  in `/proc/<pid>/cmdline`.
+- `tests/credentials-stay-on-origin.sh` fails if `curl` can load `~/.curlrc`
+  or use anything but HTTPS, or if a redirect sends the bearer token to
+  another origin.
+- `tests/cache-per-account.sh` fails if switching or clearing the credentials
+  still shows the previous account's top artists or top tracks.
 
 ## License
 

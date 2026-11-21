@@ -49,6 +49,15 @@ Panel {
     "SPOTIFY_ARTISTS": root.favoriteArtists
   })
 
+  // Changing any credential (or the favourites list) invalidates every Web API
+  // result on screen and any lookup still running, so one account's data is
+  // never shown under another's. Each lookup records the generation it started
+  // in and its result is dropped if the generation moved on meanwhile.
+  readonly property string credentialKey: [root.clientId, root.clientSecret,
+    root.accessToken, root.favoriteArtists].join("\u0000")
+  property int credentialGeneration: 0
+  onCredentialKeyChanged: resetApiState()
+
   // ---------- UI state ----------
   property string busyAction: ""
   property string errorText: ""
@@ -130,18 +139,44 @@ Panel {
     run("launch", ["launch"])
   }
 
+  // The query goes to the helper on stdin (`search -`), never in its argv.
   function doSearch() {
-    if (!searchQuery.trim() || busy) return
-    run("search", ["search", searchQuery])
+    var query = searchQuery.trim()
+    if (!query || busy || searchProc.running) return
+    errorText = ""
+    busyAction = "search"
+    searchProc.query = query
+    searchProc.generation = credentialGeneration
+    searchProc.command = [root.cli, "search", "-"]
+    searchProc.environment = root.envVars
+    searchProc.running = true
   }
 
-  function applySearchResults(raw) {
+  // The helper prints {"error": ...} on stdout when it fails, so prefer that
+  // over stderr, which only carries unexpected failures.
+  function applySearchResults(exitCode, raw, stderrText) {
     var parsed = null
     try { parsed = JSON.parse(String(raw).trim()) } catch (e) { parsed = null }
-    if (parsed && parsed.tracks) searchResults = parsed.tracks
-    else searchResults = []
+    searchResults = (parsed && parsed.tracks) ? parsed.tracks : []
     if (parsed && parsed.error) errorText = parsed.error
-    busyAction = ""
+    else if (exitCode !== 0) {
+      var lines = String(stderrText || "").trim().split("\n")
+      var last = lines[lines.length - 1].trim()
+      errorText = last !== "" ? last : "Search failed (exit " + exitCode + ")"
+    }
+  }
+
+  function resetApiState() {
+    credentialGeneration++
+    errorText = ""
+    searchResults = []
+    playlists = []
+    artists = []
+    topTracks = ({})
+    expandedArtist = ""
+    topTracksLoading = ""
+    queuedArtistId = ""
+    if (opened) { refreshPlaylists(); refreshArtists() }
   }
 
   function applyPlaylists(raw) {
@@ -194,6 +229,7 @@ Panel {
     if (topTracksProc.running) { queuedArtistId = id; return }
     topTracksLoading = id
     topTracksProc.pendingId = id
+    topTracksProc.generation = credentialGeneration
     topTracksProc.command = [root.cli, "top-tracks", id]
     topTracksProc.environment = root.envVars
     topTracksProc.running = true
@@ -265,16 +301,21 @@ Panel {
 
   Process {
     id: searchProc
+    property string query: ""
+    property int generation: 0
     environment: root.envVars
+    stdinEnabled: true
     stdout: StdioCollector { id: searchOut; waitForEnd: true }
     stderr: StdioCollector { id: searchErr; waitForEnd: true }
+    onStarted: {
+      write(query + "\n")
+      query = ""
+    }
     onExited: function(exitCode, exitStatus) {
+      var generation = searchProc.generation
       Qt.callLater(function() {
-        if (exitCode === 0) root.applySearchResults(searchOut.text)
-        else {
-          var lines = String(searchErr.text || "").trim().split("\n")
-          errorText = lines.length > 0 ? lines[lines.length - 1].trim() : "Search failed"
-        }
+        if (generation === root.credentialGeneration)
+          root.applySearchResults(exitCode, searchOut.text, searchErr.text)
         root.busyAction = ""
       })
     }
@@ -282,11 +323,17 @@ Panel {
 
   Process {
     id: playlistsProc
+    property int generation: 0
     environment: root.envVars
     stdout: StdioCollector { id: playlistsOut; waitForEnd: true }
     stderr: StdioCollector { id: playlistsErr; waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
+      var generation = playlistsProc.generation
       Qt.callLater(function() {
+        if (generation !== root.credentialGeneration) {
+          if (root.opened) root.refreshPlaylists()
+          return
+        }
         if (exitCode === 0) root.applyPlaylists(playlistsOut.text)
         root.busyAction = ""
       })
@@ -295,6 +342,7 @@ Panel {
 
   function refreshPlaylists() {
     if (playlistsProc.running) return
+    playlistsProc.generation = credentialGeneration
     playlistsProc.command = [root.cli, "playlists"]
     playlistsProc.environment = root.envVars
     playlistsProc.running = true
@@ -302,11 +350,17 @@ Panel {
 
   Process {
     id: artistsProc
+    property int generation: 0
     environment: root.envVars
     stdout: StdioCollector { id: artistsOut; waitForEnd: true }
     stderr: StdioCollector { id: artistsErr; waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
+      var generation = artistsProc.generation
       Qt.callLater(function() {
+        if (generation !== root.credentialGeneration) {
+          if (root.opened) root.refreshArtists()
+          return
+        }
         if (exitCode === 0) root.applyArtists(artistsOut.text)
         root.busyAction = ""
       })
@@ -315,6 +369,7 @@ Panel {
 
   function refreshArtists() {
     if (artistsProc.running) return
+    artistsProc.generation = credentialGeneration
     artistsProc.command = [root.cli, "artists"]
     artistsProc.environment = root.envVars
     artistsProc.running = true
@@ -323,13 +378,15 @@ Panel {
   Process {
     id: topTracksProc
     property string pendingId: ""
+    property int generation: 0
     environment: root.envVars
     stdout: StdioCollector { id: topTracksOut; waitForEnd: true }
     stderr: StdioCollector { id: topTracksErr; waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
       var id = topTracksProc.pendingId
+      var generation = topTracksProc.generation
       Qt.callLater(function() {
-        root.applyTopTracks(id, topTracksOut.text)
+        if (generation === root.credentialGeneration) root.applyTopTracks(id, topTracksOut.text)
         root.onTopTracksDone()
       })
     }
@@ -410,6 +467,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
+              textFormat: Text.PlainText
               text: root.title !== "" ? root.title : "Spotify"
               color: root.foreground
               font.family: root.fontFamily
@@ -420,6 +478,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: root.artist !== "" ? root.artist
                 : (root.album !== "" ? root.album : root.stateLabel.toUpperCase())
               color: root.dim
@@ -576,6 +635,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: modelData.name
                   color: root.foreground
                   font.family: root.fontFamily
@@ -586,6 +646,7 @@ Panel {
 
                 Text {
                   id: srArtist
+                  textFormat: Text.PlainText
                   text: modelData.artist
                   color: root.dim
                   font.family: root.fontFamily
@@ -640,6 +701,7 @@ Panel {
                   spacing: Style.space(6)
 
                   Text {
+                    textFormat: Text.PlainText
                     text: modelData.name
                     color: root.foreground
                     font.family: root.fontFamily
@@ -656,6 +718,7 @@ Panel {
 
                   Text {
                     id: arGenre
+                    textFormat: Text.PlainText
                     text: modelData.genre || ""
                     color: root.dim
                     font.family: root.fontFamily
@@ -717,6 +780,7 @@ Panel {
                       spacing: Style.space(6)
 
                       Text {
+                        textFormat: Text.PlainText
                         text: "▸ " + modelData.name
                         color: root.foreground
                         font.family: root.fontFamily
@@ -778,6 +842,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: modelData.name
                   color: root.foreground
                   font.family: root.fontFamily
@@ -788,6 +853,7 @@ Panel {
 
                 Text {
                   id: plOwner
+                  textFormat: Text.PlainText
                   text: modelData.owner
                   color: root.dim
                   font.family: root.fontFamily

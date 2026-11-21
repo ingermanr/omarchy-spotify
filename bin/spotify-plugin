@@ -11,6 +11,7 @@
 #   play-pause | next | previous | play | pause   D-Bus action
 #   launch          Start Spotify if not running
 #   search <query>  Search tracks via Spotify Web API (needs credentials)
+#   search -        Same, reading the query from the first line of stdin
 #   playlists       List featured playlists via Spotify Web API (needs credentials)
 #   artists         List main artists: the configured favourites resolved via
 #                   search, or your top artists when no favourites are set
@@ -129,7 +130,7 @@ get_access_token() {
   if [[ -n "$SPOTIFY_CLIENT_ID" && -n "$SPOTIFY_CLIENT_SECRET" ]]; then
     local resp token user
     user=$(curl_config_quote "${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}") || return 1
-    resp=$(printf 'user = %s\n' "$user" | curl --config - -fsS -m 10 \
+    resp=$(printf 'user = %s\n' "$user" | sp_curl -fsS -m 10 \
       -d grant_type=client_credentials \
       https://accounts.spotify.com/api/token 2>/dev/null) || true
     token=$(echo "$resp" | jq -r '.access_token // empty' 2>/dev/null || true)
@@ -153,12 +154,74 @@ curl_config_quote() {
   printf '"%s"' "$v"
 }
 
-# curl with a bearer token header read from stdin. Usage: curl_bearer <token> <curl args...>
+# Every request carries credentials, so curl runs with:
+#   -q            first argument: do not load ~/.curlrc, which could disable
+#                 certificate checks (insecure) or forward credentials on
+#                 redirects (location-trusted)
+#   --proto       HTTPS only, for the request and for any redirect
+# and reads its credentials and URL as a config on stdin. Redirects are never
+# followed (no -L).
+sp_curl() {
+  curl -q --proto =https --proto-redir =https --config - "$@"
+}
+
+# curl with a bearer token header and the URL read from stdin, restricted to
+# the Web API origin. Usage: curl_bearer <token> <url> <curl args...>
 curl_bearer() {
-  local token="$1" header
-  shift
+  local token="$1" url="$2" header qurl
+  shift 2
+  [[ "$url" == https://api.spotify.com/* ]] || return 1
   header=$(curl_config_quote "Authorization: Bearer $token") || return 1
-  printf 'header = %s\n' "$header" | curl --config - "$@"
+  qurl=$(curl_config_quote "$url") || return 1
+  printf 'header = %s\nurl = %s\n' "$header" "$qurl" | sp_curl "$@"
+}
+
+# Python Web API client prepended to the embedded scripts: verified HTTPS,
+# api.spotify.com only, and redirects refused, because urllib would otherwise
+# resend the Authorization header to wherever a response redirects.
+SP_PY_HTTP=$(cat <<'PY'
+import json, ssl, urllib.parse, urllib.request
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+_opener = urllib.request.build_opener(
+    _NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+
+def api_get(url, token):
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.netloc != "api.spotify.com":
+        raise ValueError("refusing to send credentials to %s" % parts.netloc)
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+    with _opener.open(req, timeout=10) as r:
+        return json.load(r)
+PY
+)
+
+# Run an embedded python script with the Web API client in front of it. The
+# script arrives on stdin, so its stdin is not available for data.
+# Usage: py_api <args...> <<'PY' ... PY
+py_api() {
+  { printf '%s\n' "$SP_PY_HTTP"; cat; } | python3 - "$@"
+}
+
+# Identity of the active credentials, used to scope cached results so one
+# account never sees another's. Prints a sha256 of the credential source and
+# fails when no credentials are configured. Nothing here reaches an argv.
+credential_fingerprint() {
+  local src="" t
+  if [[ -n "${SPOTIFY_ACCESS_TOKEN:-}" ]]; then
+    src="token:$SPOTIFY_ACCESS_TOKEN"
+  elif [[ -f "$TOKEN_FILE" ]] && t=$(jq -r '.access_token // empty' "$TOKEN_FILE" 2>/dev/null) && [[ -n "$t" ]]; then
+    src="token:$t"
+  elif [[ -n "$SPOTIFY_CLIENT_ID" && -n "$SPOTIFY_CLIENT_SECRET" ]]; then
+    src="client:$SPOTIFY_CLIENT_ID:$SPOTIFY_CLIENT_SECRET"
+  else
+    return 1
+  fi
+  printf '%s' "$src" | sha256sum | cut -d' ' -f1
 }
 
 sp_api_search() {
@@ -167,8 +230,8 @@ sp_api_search() {
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
   local encoded payload
   encoded=$(printf '%s' "$query" | jq -sRr @uri)
-  payload=$(curl_bearer "$token" -fsS -m 10 \
-    "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" 2>/dev/null) || true
+  payload=$(curl_bearer "$token" \
+    "https://api.spotify.com/v1/search?q=$encoded&type=track&limit=10" -fsS -m 10 2>/dev/null) || true
   printf '%s' "$payload" | python3 -c '
 import json, sys
 try:
@@ -192,8 +255,8 @@ sp_api_playlists() {
   local token
   token=$(get_access_token) || { echo '{"error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 1; }
   local payload
-  payload=$(curl_bearer "$token" -fsS -m 10 \
-    "https://api.spotify.com/v1/browse/featured-playlists?limit=12" 2>/dev/null) || true
+  payload=$(curl_bearer "$token" \
+    "https://api.spotify.com/v1/browse/featured-playlists?limit=12" -fsS -m 10 2>/dev/null) || true
   printf '%s' "$payload" | python3 -c '
 import json, sys
 try:
@@ -215,14 +278,28 @@ except Exception:
 # Resolve the configured favourite artists (SPOTIFY_ARTISTS) to real Spotify
 # artists via search, or fall back to your personal top artists when the list is
 # empty and a user-scoped token is available. Cached for ARTIST_CACHE_TTL.
+#
+# The cache belongs to the credentials that filled it: credentials are checked
+# before the cache, the cache key includes their fingerprint, and a cache left
+# by other (or no) credentials is deleted instead of shown.
 sp_api_artists() {
-  local key="${SPOTIFY_ARTISTS:-__top__}" cached
+  local fp
+  if ! fp=$(credential_fingerprint); then
+    rm -f "$ARTIST_CACHE" "$TOPTRACK_CACHE"
+    echo '{"artists": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'
+    return 0
+  fi
 
-  cached=$(python3 - "$ARTIST_CACHE" "$key" "$ARTIST_CACHE_TTL" 2>/dev/null <<'PY'
-import json, sys, time
+  local cached
+  cached=$(SPOTIFY_CACHE_CRED="$fp" SPOTIFY_CACHE_KEY="${SPOTIFY_ARTISTS:-__top__}" \
+    python3 - "$ARTIST_CACHE" "$ARTIST_CACHE_TTL" 2>/dev/null <<'PY'
+import json, os, sys, time
+path, ttl = sys.argv[1], int(sys.argv[2])
 try:
-    d = json.load(open(sys.argv[1]))
-    if d.get("key") == sys.argv[2] and time.time() - d.get("ts", 0) < int(sys.argv[3]):
+    d = json.load(open(path))
+    if d.get("cred") != os.environ["SPOTIFY_CACHE_CRED"]:
+        os.remove(path)
+    elif d.get("key") == os.environ["SPOTIFY_CACHE_KEY"] and time.time() - d.get("ts", 0) < ttl:
         print(json.dumps(d["data"]))
 except Exception:
     pass
@@ -234,18 +311,14 @@ PY
   token=$(get_access_token) || { echo '{"artists": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
 
   local result
-  result=$(SPOTIFY_BEARER="$token" SPOTIFY_FAVOURITES="$SPOTIFY_ARTISTS" python3 - <<'PY'
-import json, os, urllib.request, urllib.parse
+  result=$(SPOTIFY_BEARER="$token" SPOTIFY_FAVOURITES="$SPOTIFY_ARTISTS" py_api <<'PY'
+import os
 
 token = os.environ["SPOTIFY_BEARER"]
 favourites = [a.strip() for a in os.environ.get("SPOTIFY_FAVOURITES", "").split(",") if a.strip()]
 
 def api(path):
-    req = urllib.request.Request(
-        "https://api.spotify.com/v1/" + path,
-        headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
+    return api_get("https://api.spotify.com/v1/" + path, token)
 
 def artist_obj(a):
     imgs = a.get("images") or []
@@ -281,32 +354,45 @@ PY
 
   # Cache only successful lookups, so a transient failure is not remembered.
   # The response arrives on stdin, so it never shows up in a process argv.
-  printf '%s' "$result" | python3 -c '
-import json, sys, time
+  printf '%s' "$result" | SPOTIFY_CACHE_CRED="$fp" SPOTIFY_CACHE_KEY="${SPOTIFY_ARTISTS:-__top__}" python3 -c '
+import json, os, sys, time
 try:
     data = json.loads(sys.stdin.read())
     if "error" not in data:
-        json.dump({"ts": time.time(), "key": sys.argv[2], "data": data}, open(sys.argv[1], "w"))
+        json.dump({"ts": time.time(), "cred": os.environ["SPOTIFY_CACHE_CRED"],
+                   "key": os.environ["SPOTIFY_CACHE_KEY"], "data": data}, open(sys.argv[1], "w"))
 except Exception:
     pass
-' "$ARTIST_CACHE" "$key" 2>/dev/null || true
+' "$ARTIST_CACHE" 2>/dev/null || true
   echo "$result"
 }
 
 # The artist's most popular tracks. Cached per artist (multi-entry) for
 # ARTIST_CACHE_TTL. Tries `from_token` first (user tokens) then a country market.
+# Like the artists cache, it belongs to the credentials that filled it.
 sp_api_top_tracks() {
   local id="${1:-}"
   [[ -n "$id" ]] || { echo '{"tracks": [], "error": "missing artist id"}'; return 0; }
 
+  local fp
+  if ! fp=$(credential_fingerprint); then
+    rm -f "$ARTIST_CACHE" "$TOPTRACK_CACHE"
+    echo '{"tracks": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'
+    return 0
+  fi
+
   local key="top:$id" cached
-  cached=$(python3 - "$TOPTRACK_CACHE" "$key" "$ARTIST_CACHE_TTL" 2>/dev/null <<'PY'
-import json, sys, time
+  cached=$(SPOTIFY_CACHE_CRED="$fp" python3 - "$TOPTRACK_CACHE" "$key" "$ARTIST_CACHE_TTL" 2>/dev/null <<'PY'
+import json, os, sys, time
+path, key, ttl = sys.argv[1], sys.argv[2], int(sys.argv[3])
 try:
-    d = json.load(open(sys.argv[1]))
-    e = d.get(sys.argv[2])
-    if e and time.time() - e.get("ts", 0) < int(sys.argv[3]):
-        print(json.dumps(e["data"]))
+    d = json.load(open(path))
+    if d.get("cred") != os.environ["SPOTIFY_CACHE_CRED"]:
+        os.remove(path)
+    else:
+        e = d.get("entries", {}).get(key)
+        if e and time.time() - e.get("ts", 0) < ttl:
+            print(json.dumps(e["data"]))
 except Exception:
     pass
 PY
@@ -317,19 +403,17 @@ PY
   token=$(get_access_token) || { echo '{"tracks": [], "error": "Spotify API credentials not configured. Set SPOTIFY_ACCESS_TOKEN or SPOTIFY_CLIENT_ID/SECRET."}'; return 0; }
 
   local result
-  result=$(SPOTIFY_BEARER="$token" python3 - "$id" "$SPOTIFY_MARKET" <<'PY'
-import json, os, sys, urllib.request
+  result=$(SPOTIFY_BEARER="$token" py_api "$id" "$SPOTIFY_MARKET" <<'PY'
+import os, sys
 
 token = os.environ["SPOTIFY_BEARER"]
 artist_id, market = sys.argv[1], sys.argv[2]
 markets = [market] if market else ["from_token", "US"]
 
 def fetch(m):
-    req = urllib.request.Request(
-        "https://api.spotify.com/v1/artists/%s/top-tracks?market=%s" % (artist_id, m),
-        headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
+    return api_get(
+        "https://api.spotify.com/v1/artists/%s/top-tracks?market=%s"
+        % (urllib.parse.quote(artist_id, safe=""), urllib.parse.quote(m, safe="")), token)
 
 def track_obj(t):
     return {
@@ -359,16 +443,19 @@ PY
 
   # Multi-entry cache: keep several artists, only store successful lookups.
   # The response arrives on stdin, so it never shows up in a process argv.
-  printf '%s' "$result" | python3 -c '
-import json, sys, time
+  printf '%s' "$result" | SPOTIFY_CACHE_CRED="$fp" python3 -c '
+import json, os, sys, time
 try:
     data = json.loads(sys.stdin.read())
     if "error" not in data:
+        cred = os.environ["SPOTIFY_CACHE_CRED"]
         try:
             d = json.load(open(sys.argv[1]))
         except Exception:
             d = {}
-        d[sys.argv[2]] = {"ts": time.time(), "data": data}
+        if d.get("cred") != cred:
+            d = {"cred": cred, "entries": {}}
+        d.setdefault("entries", {})[sys.argv[2]] = {"ts": time.time(), "data": data}
         json.dump(d, open(sys.argv[1], "w"))
 except Exception:
     pass
@@ -390,9 +477,9 @@ play_uri() {
     else
       body="{\"context_uri\": \"$uri\"}"
     fi
-    code=$(curl_bearer "$token" -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
-      -H "Content-Type: application/json" \
-      -d "$body" "https://api.spotify.com/v1/me/player/play" 2>/dev/null) || code=000
+    code=$(curl_bearer "$token" "https://api.spotify.com/v1/me/player/play" \
+      -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
+      -H "Content-Type: application/json" -d "$body" 2>/dev/null) || code=000
     [[ "$code" == "204" || "$code" == "200" ]] && return 0
   fi
 
@@ -415,9 +502,9 @@ play_tracks() {
   if token=$(get_access_token) 2>/dev/null && [[ -n "$token" ]]; then
     local body code
     body=$(printf '%s\n' "${uris[@]}" | jq -R . | jq -s '{uris: .}')
-    code=$(curl_bearer "$token" -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
-      -H "Content-Type: application/json" \
-      -d "$body" "https://api.spotify.com/v1/me/player/play" 2>/dev/null) || code=000
+    code=$(curl_bearer "$token" "https://api.spotify.com/v1/me/player/play" \
+      -s -o /dev/null -w '%{http_code}' -m 10 -X PUT \
+      -H "Content-Type: application/json" -d "$body" 2>/dev/null) || code=000
     [[ "$code" == "204" || "$code" == "200" ]] && return 0
   fi
 
@@ -475,7 +562,14 @@ case "$cmd" in
     fi
     ;;
   search)
-    sp_api_search "${1:-}"
+    # `search -` reads the query from stdin so it stays out of the process argv.
+    if [[ "${1:-}" == "-" ]]; then
+      query=""
+      IFS= read -r query || true
+      sp_api_search "$query"
+    else
+      sp_api_search "${1:-}"
+    fi
     ;;
   playlists)
     sp_api_playlists
